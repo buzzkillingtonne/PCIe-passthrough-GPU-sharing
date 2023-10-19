@@ -1,0 +1,24 @@
+Verify the PCI device ID that you will be passing through to a VM, it's needed for the script and the pass through.
+Under /etc/modules-load.d/modules ensure the vfio drivers are at the top (before any nvidia modules).
+
+Create this script under /usr/bin/vfio-pci-override.sh
+
+#!/bin/sh
+
+DEVS="0000:42:00.0"
+
+if [ ! -z "$(ls -A /sys/class/iommu)" ]; then
+    for DEV in $DEVS; do
+        for IOMMUDEV in $(ls /sys/bus/pci/devices/$DEV/iommu_group/devices) ; do
+            echo "vfio-pci" > /sys/bus/pci/devices/$IOMMUDEV/driver_override
+        done
+    done
+fi
+
+In the script, make sure to use your PCI device address for the DEVS variable. This can be found with lspci -vv
+
+modprobe -i vfio-pci
+
+Create /etc/modprobe.d/vfio.conf and add "install vfio-pci /usr/bin/vfio-pci-override.sh" in the file. This will ensure that the VFIO drivers are applied to the correct device. 
+
+On the VM configuration in Proxmox add the PCI device, do not add as primary GPU if you still need VNC console access. Verify the CPU cores and set the affinity to whatever the physical cores on one CPU are, in my case 1,3,5,7,9,11,13,15 when done with VNC console, enable the GPU by making it the primary device.

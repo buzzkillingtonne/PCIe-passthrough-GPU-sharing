@@ -1,0 +1,87 @@
+Nvidia Driver Install
+
+On Proxmox: 
+
+apt install pve-headers-$(uname -r)
+
+wget http://us.download.nvidia.com/XFree86/Linux-x86_64/xxx.xx.xx/NVIDIA-Linux-x86_64-xxx.xx.xx.run && chmod +x NVIDIA-Linux-x86_64-xxx.xx.xx.run && ./NVIDIA-Linux-x86_64-xxx.xx.xx.run --dkms (replace the xxx.xx.xx with the correct version number)
+
+** MAKE SURE ** that you are using the same driver version for both Proxmox and the guest LXC.
+
+--dkms is needed to automatically rebuild the module for the new kernel when it's updated, otherwise you need to reinstall the driver manually after a kernel update.
+
+clone and patch the drivers after install from this github: https://github.com/keylase/nvidia-patch This patch removes the 3 NVENC session limit on the Quadro P1000 GPU
+
+git clone https://github.com/keylase/nvidia-patch.git nvidia-patch && chmod +x ./nvidia-patch/patch.sh && bash ./nvidia-patch/patch.sh
+
+!!! if you get an error when installing after installing a kernel update, download the latest nvidia driver and try that before anything else !!!
+
+On the guest LXC server:
+
+wget http://us.download.nvidia.com/XFree86/Linux-x86_64/xxx.xx.xx/NVIDIA-Linux-x86_64-xxx.xx.xx.run && chmod +x NVIDIA-Linux-x86_64-xxx.xx.xx.run && ./NVIDIA-Linux-x86_64-xxx.xx.xx.run --no-kernel-module
+
+--no-kernel-module is required as for an LXC and will share the kernel module with the host system.
+
+git clone https://github.com/keylase/nvidia-patch.git nvidia-patch && chmod +x ./nvidia-patch/patch.sh && bash ./nvidia-patch/patch.sh
+
+REBOOT PROXMOX AT THIS POINT
+
+On Proxmox:
+
+cat /etc/modules-load.d/modules.conf ensure nvidia and nvidia-uvm are present
+
+Verify devices show up with the below commands and ensure the numbers in the fifth column of these commands line up with the below LXC settings, if not, adjust the numbers in the LXC settings and apply these settings to your LXC config file:
+
+Commands:
+ls -lah /dev/dri*
+ls -lah /dev/nvidia*
+
+LXC settings:
+lxc.cgroup.devices.allow: c 226:* rwm
+lxc.cgroup.devices.allow: c 195:* rwm
+lxc.cgroup.devices.allow: c 235:* rwm
+
+Create the script /root/bin/nvidia-dev-node-setup.sh:
+#!/bin/bash
+# Thanks to https://www.reddit.com/r/jellyfin/comments/cig9kh/nvidia_quadro_p400_passthrough_on_proxmox/
+# Create this script in a directory such as /root/boot-scripts/ and add to a cronjob in /etc/cron.d/ to run @reboot
+# Ensure in /etc/modules that the VFIO kernel modules are listed before the nvidia modules, ideally the nvidia modules should be in their own file unter /etc/module-load.d/nvidia.conf.
+# This will ensure that the selected PCI GPU in this script will get the vfio drivers, and the other PCI GPU of the same model will get the nvidia drivers applied
+
+/sbin/modprobe nvidia
+
+# find the PCI address of the device you want to have the vfio drivers applied to by using lspci
+PCIaddress='04:00'
+
+if [ "$?" -eq 0 ]; then
+    # Count the number of NVIDIA controllers found.
+    NVDEVS=$(lspci | grep -i 04:00)
+    N3D=$(echo "$NVDEVS" | grep "3D controller" | wc -l)
+    NVGA=$(echo "$NVDEVS" | grep "VGA compatible controller" | wc -l)
+    N=$(expr $N3D + $NVGA - 1)
+    for i in $(seq 0 $N); do
+        mknod -m 666 /dev/nvidia$i c 195 $i
+    done
+    mknod -m 666 /dev/nvidiactl c 195 255
+else
+    exit 1
+fi
+
+/sbin/modprobe nvidia-uvm
+
+if [ "$?" -eq 0 ]; then
+     # Find out the major device number used by the nvidia-uvm driver
+     D=$(grep nvidia-uvm /proc/devices | awk '{print $1}')
+     mknod -m 666 /dev/nvidia-uvm c $D 0
+else
+    exit 1
+fi
+
+
+Run on Proxmox:
+
+/usr/bin/nvidia-modprobe -u -c 0
+
+/usr/bin/nvidia-persistenced --persistence-mode
+
+Create a cron job at /etc/cron.d/nvidia-dev-node-setup with the text: @reboot /root/bin/nvidia-dev-node-setup.sh
