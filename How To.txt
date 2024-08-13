@@ -1,0 +1,126 @@
+I am using Nvidia and Jellyfin, but these instructions also apply to Plex, however I've not tested this with intel, AMD, or intel igpu.
+
+Nvidia Driver Install
+On Proxmox: apt install pve-headers-$(uname -r) gcc make
+
+wget http://us.download.nvidia.com/XFree86/Linux-x86_64/xxx.xx.xx/NVIDIA-Linux-x86_64-xxx.xx.xx.run && chmod +x NVIDIA-Linux-x86_64-xxx.xx.xx.run && ./NVIDIA-Linux-x86_64-xxx.xx.xx.run --dkms (replace the xxx.xx.xx with the correct version number)
+
+** MAKE SURE ** that you are using the same driver version for both Proxmox and Jellyfin.
+
+--dkms is needed to automatically rebuild the module for the new kernel when it's updated, otherwise you need to reinstall the driver manually after a kernel update.
+
+clone and patch the drivers after install from this github: https://github.com/keylase/nvidia-patch This patch removes the 3 NVENC session limit on the Quadro P1000 GPU
+
+git clone https://github.com/keylase/nvidia-patch.git nvidia-patch && chmod +x ./nvidia-patch/patch.sh && bash ./nvidia-patch/patch.sh
+
+!!! if you get an error when installing after installing a kernel update, download the latest nvidia driver and try that before anything else !!!
+
+On Jellyfin:
+
+wget http://us.download.nvidia.com/XFree86/Linux-x86_64/xxx.xx.xx/NVIDIA-Linux-x86_64-xxx.xx.xx.run && chmod +x NVIDIA-Linux-x86_64-xxx.xx.xx.run && ./NVIDIA-Linux-x86_64-xxx.xx.xx.run --no-kernel-module
+
+--no-kernel-module is required as Jellyfin in an LXC will share the kernel module with the host system.
+
+git clone https://github.com/keylase/nvidia-patch.git nvidia-patch && chmod +x ./nvidia-patch/patch.sh && bash ./nvidia-patch/patch.sh
+
+REBOOT PROXMOX AT THIS POINT
+
+
+First Time Doing Nvidia GPU Sharing
+
+cat /etc/modules-load.d/modules.conf ensure nvidia and nvidia-uvm are present
+
+Verify devices show up with the below commands and ensure the fifth column of these commands line up with the LXC settings, if not, adjust the LXC settings. Ignore output from /dev/nvidia-caps and /dev/dri/by-path.
+
+Commands:
+
+ls -lah /dev/dri/*
+
+e.g.
+
+crw-rw-rw- 1 root root 195,   0 Jul 28 14:34 /dev/nvidia0
+crw-rw-rw- 1 root root 195, 255 Jul 28 14:34 /dev/nvidiactl
+crw-rw-rw- 1 root root 195, 254 Jul 28 14:34 /dev/nvidia-modeset
+crw-rw-rw- 1 root root 237,   0 Jul 28 14:34 /dev/nvidia-uvm
+crw-rw-rw- 1 root root 237,   1 Jul 28 14:34 /dev/nvidia-uvm-tools
+
+ls -lah /dev/nvidia*
+
+e.g.
+
+crw-rw---- 1 root video 226,   0 Jul 28 14:34 /dev/dri/card0
+crw-rw---- 1 root video 226,   1 Jul 28 14:34 /dev/dri/card1
+crw-rw---- 1 root video 226, 128 Jul 28 14:34 /dev/dri/renderD128
+
+LXC settings:
+
+lxc.cgroup.devices.allow: c 226:* rwm
+lxc.cgroup.devices.allow: c 195:* rwm
+lxc.cgroup.devices.allow: c 235:* rwm
+
+Verify the startup script at /root/bin/nvidia-dev-node-setup.sh exists and contains the information from: https://www.reddit.com/r/jellyfin/comments/cig9kh/nvidia_quadro_p400_passthrough_on_proxmox/ and is executable.
+
+#!/bin/bash
+# Thanks to https://www.reddit.com/r/jellyfin/comments/cig9kh/nvidia_quadro_p400_passthrough_on_proxmox/
+# Create this script in a directory such as /root/boot-scripts/ and add to a cronjob in /etc/cron.d/ to run @reboot
+# Ensure in /etc/modules that the VFIO kernel modules are listed before the nvidia modules, ideally the nvidia modules should be in their own file unter /etc/module-load.d/nvidia.conf.
+# This will ensure that the selected PCI GPU in this script will get the vfio drivers, and the other PCI GPU of the same model will get the nvidia drivers applied
+
+/sbin/modprobe nvidia
+
+# find the PCI address of the device you want to have the vfio drivers applied to by using lspci
+PCIaddress='04:00'
+
+if [ "$?" -eq 0 ]; then
+    # Count the number of NVIDIA controllers found.
+    NVDEVS=$(lspci | grep -i 04:00)
+    N3D=$(echo "$NVDEVS" | grep "3D controller" | wc -l)
+    NVGA=$(echo "$NVDEVS" | grep "VGA compatible controller" | wc -l)
+    N=$(expr $N3D + $NVGA - 1)
+    for i in $(seq 0 $N); do
+        mknod -m 666 /dev/nvidia$i c 195 $i
+    done
+    mknod -m 666 /dev/nvidiactl c 195 255
+else
+    exit 1
+fi
+
+/sbin/modprobe nvidia-uvm
+
+if [ "$?" -eq 0 ]; then
+     # Find out the major device number used by the nvidia-uvm driver
+     D=$(grep nvidia-uvm /proc/devices | awk '{print $1}')
+     mknod -m 666 /dev/nvidia-uvm c $D 0
+else
+    exit 1
+fi
+
+/usr/bin/nvidia-modprobe -u -c 0
+
+/usr/bin/nvidia-persistenced --persistence-mode
+
+Create a cron job at /etc/cron.d/nvidia-dev-node-setup with the text: @reboot /root/bin/nvidia-dev-node-setup.sh
+
+
+Unrelated:
+Gaming VM GPU passthrough
+
+Verify the PCI device ID that you will be passing through to a VM, that is needed for the script and the pass through. Under /etc/modules-load.d/modules ensure the vfio drivers are at the top (before any nvidia modules) Create the a script found at https://wiki.archlinux.org/title/PCI_passthrough_via_OVMF#Using_identical_guest_and_host_GPUs under /usr/bin/vfio-pci-override.sh
+
+In the script, make sure to us your PCI device address for the DEVS variable. this can be found with lspci -vv
+
+#!/bin/sh
+
+DEVS="0000:02:00.0"
+
+if [ ! -z "$(ls -A /sys/class/iommu)" ]; then
+    for DEV in $DEVS; do
+        for IOMMUDEV in $(ls /sys/bus/pci/devices/$DEV/iommu_group/devices) ; do
+            echo "vfio-pci" > /sys/bus/pci/devices/$IOMMUDEV/driver_override
+        done
+    done
+fi
+
+modprobe -i vfio-pci
+
+Create /etc/modprobe.d/vfio.conf and add install vfio-pci /root/bin/vfio-pci-override.sh in the file. This will ensure that the VFIO drivers are applied to the correct device. On the VM add the PCI device, do not add as primary GPU if you still need VNC console access Verify the CPU cores and set the affinity to whatever the physical cores on one CPU are, in our case 1,3,5,7,9,11,13,15 when done with VNC console, enable the GPU by making it the primary device
